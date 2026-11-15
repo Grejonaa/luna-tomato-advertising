@@ -1,1 +1,4 @@
 
+Algorithm,Iterations,Best_Objective,Spacecraft,MSE,Feasible,Runtime_Seconds
+Random Search,50,4343.998974,5,0.452399,False,4.57
+
