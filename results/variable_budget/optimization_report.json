@@ -1,0 +1,16 @@
+{
+  "algorithm": "Variable-Budget Greedy Pruning + Adaptive Simulated Annealing",
+  "input": "results\\plots\\best_solution.npy",
+  "objective": 34.0,
+  "spacecraft": 34,
+  "mse": 0.04870848708487085,
+  "mse_threshold": 0.05,
+  "feasible": true,
+  "runtime_seconds": 401.5042266845703,
+  "accepted_reductions": 0,
+  "attempts": 10,
+  "iterations_per_attempt": 3000,
+  "candidates_per_reduction": 5,
+  "restarts_per_candidate": 2,
+  "seed": 42
+}

@@ -4,7 +4,7 @@ Initial setup for the Luna Tomato Advertising optimization problem.
 """
 
 import numpy as np
-from celestial_morse_code import udp
+from src.celestial_morse_code import udp
 
 
 def get_problem():
