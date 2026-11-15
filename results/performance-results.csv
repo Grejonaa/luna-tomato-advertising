@@ -2,3 +2,11 @@
 Algorithm,Iterations,Best_Objective,Spacecraft,MSE,Feasible,Runtime_Seconds
 Random Search,50,4343.998974,5,0.452399,False,4.57
 
+FINAL HYBRID RESULT
+===================
+Previous MSE: 0.191144
+New MSE:      0.174908
+Objective:    4089.612940
+Spacecraft:   39
+Feasible:     False
+Runtime:      122.83 seconds
