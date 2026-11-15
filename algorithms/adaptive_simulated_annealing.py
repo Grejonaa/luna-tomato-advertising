@@ -1,10 +1,15 @@
-"""Fixed-budget fleet refinement using residual-guided simulated annealing.
+"""ESA Stage 2 simulated annealing adapted to this project's chromosome API.
 
-The fleet size is kept constant. Moves replace spacecraft/orbits or perturb phases;
-phase candidates are guided by the residual between target and current signal.
+Keeps the public interface expected by variable_budget_optimization.py:
+adaptive_simulated_annealing(...)->OptimizationResult
+
+The search strategy follows the supplied Stage 2 implementation:
+replace, multiswap, phase shift, residual-guided insertion, destruction/
+reconstruction, reheating, and optional L-BFGS-B phase refinement.
 """
 from __future__ import annotations
 
+import copy
 import math
 import time
 from dataclasses import dataclass
@@ -12,182 +17,96 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.optimize import minimize
 
-
 TAU = 2.0 * np.pi
-
-
-def _raw_fleet_signal(udp, solution: np.ndarray) -> np.ndarray:
-    """Sum individual spacecraft signals without allocating ESA's large matrix."""
-    raw = np.zeros_like(udp.target_signal, dtype=float)
-    for orbit in range(udp.num_orbits):
-        count = int(round(solution[orbit]))
-        for slot in range(count):
-            phase = solution[_phase_index(udp, orbit, slot)]
-            raw += _orbit_signal(udp, orbit, float(phase))
-    return raw
-
-
-def _mse_from_raw(udp, raw_signal: np.ndarray) -> float:
-    reconstructed = np.clip(raw_signal, 0.0, 1.0)
-    return float(np.mean((reconstructed - udp.target_signal) ** 2))
-
-
-def _orbit_signal(udp, orbit: int, phase: float) -> np.ndarray:
-    """Return the exact contribution of one spacecraft on the given orbit."""
-    t = udp.t
-    if orbit < udp.num_dro:
-        freq = udp.frequencies_dro[orbit]
-        center = (TAU - phase) / TAU / freq
-        return udp.amplitudes_dro[orbit] * udp._repeating_box_window(
-            t, center, freq
-        )
-
-    if orbit < udp.num_dro + udp.num_lyap:
-        local = orbit - udp.num_dro
-        f1 = udp.frequencies_lyap[local]
-        f2 = udp.frequencies_lyap[udp.num_lyap + local]
-        c1 = (TAU - phase) / TAU / f1
-        c2 = (phase + np.pi) / f2
-        return (
-            udp.amplitudes_lyap[local]
-            * udp._repeating_box_window(t, c1, f1)
-            + udp.amplitudes_lyap[udp.num_lyap + local]
-            * udp._repeating_box_window(t, c2, f2)
-        )
-
-    local = orbit - udp.num_dro - udp.num_lyap
-    f1 = udp.frequencies_axial[local]
-    f2 = udp.frequencies_axial[udp.num_axial + local]
-    c1 = (TAU - phase) / TAU / f1
-    c2 = (phase + np.pi) / f2
-    return (
-        udp.amplitudes_axial[local]
-        * udp._repeating_box_window(t, c1, f1)
-        + udp.amplitudes_axial[udp.num_axial + local]
-        * udp._repeating_box_window(t, c2, f2)
-    )
-
-
-def _active_slots(solution: np.ndarray, udp) -> list[tuple[int, int]]:
-    slots = []
-    for orbit in range(udp.num_orbits):
-        for slot in range(int(round(solution[orbit]))):
-            slots.append((orbit, slot))
-    return slots
 
 
 def _phase_index(udp, orbit: int, slot: int) -> int:
     return udp.num_orbits + orbit * udp.max_per_orbit + slot
 
 
-def _remove_slot(
-    solution: np.ndarray, udp, orbit: int, slot: int
-) -> np.ndarray:
+def _active_slots(solution: np.ndarray, udp) -> list[tuple[int, int]]:
+    return [
+        (orbit, slot)
+        for orbit in range(udp.num_orbits)
+        for slot in range(int(round(solution[orbit])))
+    ]
+
+
+def _remove_slot(solution: np.ndarray, udp, orbit: int, slot: int) -> np.ndarray:
     candidate = solution.copy()
     count = int(round(candidate[orbit]))
     start = _phase_index(udp, orbit, 0)
-    phases = candidate[start:start + count].copy()
-    phases = np.delete(phases, slot)
+    phases = np.delete(candidate[start:start + count].copy(), slot)
     candidate[orbit] = count - 1
     candidate[start:start + count - 1] = phases
     candidate[start + count - 1] = 0.0
     return candidate
 
 
-def _add_to_orbit(
-    solution: np.ndarray, udp, orbit: int, phase: float
-) -> np.ndarray:
-    candidate = solution.copy()
-    count = int(round(candidate[orbit]))
-    if count >= udp.max_per_orbit:
-        return candidate
-    candidate[orbit] = count + 1
-    candidate[_phase_index(udp, orbit, count)] = phase % TAU
-    return candidate
+def _orbit_signal(udp, orbit: int, phase: float) -> np.ndarray:
+    """Same single-spacecraft signal construction used by the supplied Stage 2."""
+    if orbit < udp.num_dro:
+        frequency = udp.frequencies_dro[orbit]
+        start = (TAU - phase) / TAU / frequency
+        return udp.amplitudes_dro[orbit] * udp._repeating_box_window(
+            udp.t, start, frequency=frequency
+        )
 
-
-def _residual_phase(
-    udp,
-    orbit: int,
-    current_signal: np.ndarray,
-    rng: np.random.Generator,
-    grid_size: int = 50,
-) -> float:
-    residual = udp.target_signal - current_signal
-    grid = np.linspace(0.0, TAU, grid_size, endpoint=False)
-    scores = [
-        float(np.dot(_orbit_signal(udp, orbit, p), residual))
-        for p in grid
-    ]
-    best = float(grid[int(np.argmax(scores))])
-
-    local = best + np.linspace(-0.10, 0.10, 11)
-    local_scores = [
-        float(
-            np.dot(
-                _orbit_signal(udp, orbit, p % TAU),
-                residual,
+    if orbit < udp.num_dro + udp.num_lyap:
+        local = orbit - udp.num_dro
+        f1 = udp.frequencies_lyap[local]
+        f2 = udp.frequencies_lyap[udp.num_lyap + local]
+        return (
+            udp.amplitudes_lyap[local] * udp._repeating_box_window(
+                udp.t, (TAU - phase) / TAU / f1, frequency=f1
+            )
+            + udp.amplitudes_lyap[udp.num_lyap + local] * udp._repeating_box_window(
+                udp.t, (phase + np.pi) / f2, frequency=f2
             )
         )
-        for p in local
-    ]
-    best = float(local[int(np.argmax(local_scores))] % TAU)
 
-    # Small randomized jitter avoids repeatedly proposing the same phase.
-    return float((best + rng.normal(0.0, 0.015)) % TAU)
-
-
-def _official_mse(udp, solution: np.ndarray) -> float:
-    _, _, mse = udp.fitness(solution, postprocess=True)
-    return float(mse)
-
-
-def _phase_refine(
-    udp, solution: np.ndarray, maxiter: int = 25
-) -> np.ndarray:
-    """Locally refine active phases while keeping orbit counts unchanged."""
-    slots = _active_slots(solution, udp)
-    if not slots:
-        return solution.copy()
-
-    indices = np.array(
-        [_phase_index(udp, o, s) for o, s in slots],
-        dtype=int,
-    )
-    x0 = solution[indices].copy()
-
-    base_raw = _raw_fleet_signal(udp, solution)
-    old_signals = [
-        _orbit_signal(
-            udp,
-            orbit,
-            float(solution[_phase_index(udp, orbit, slot)]),
+    local = orbit - udp.num_dro - udp.num_lyap
+    f1 = udp.frequencies_axial[local]
+    f2 = udp.frequencies_axial[udp.num_axial + local]
+    return (
+        udp.amplitudes_axial[local] * udp._repeating_box_window(
+            udp.t, (TAU - phase) / TAU / f1, frequency=f1
         )
-        for orbit, slot in slots
-    ]
-
-    def objective(active_phases):
-        raw = base_raw.copy()
-        for (orbit, slot), old_signal, phase in zip(
-            slots, old_signals, active_phases
-        ):
-            raw += (
-                _orbit_signal(udp, orbit, float(phase % TAU))
-                - old_signal
-            )
-        return _mse_from_raw(udp, raw)
-
-    result = minimize(
-        objective,
-        x0,
-        method="L-BFGS-B",
-        bounds=[(0.0, TAU) for _ in indices],
-        options={"maxiter": maxiter, "ftol": 1e-7},
+        + udp.amplitudes_axial[udp.num_axial + local] * udp._repeating_box_window(
+            udp.t, (phase + np.pi) / f2, frequency=f2
+        )
     )
 
-    refined = solution.copy()
-    refined[indices] = np.mod(result.x, TAU)
-    return refined
+
+def _mse(udp, signal_sum: np.ndarray) -> float:
+    reconstructed = np.clip(signal_sum, 0.0, 1.0)
+    return float(np.mean((reconstructed - udp.target_signal) ** 2))
+
+
+def _to_fleet(udp, solution: np.ndarray) -> list[dict]:
+    fleet = []
+    for orbit, slot in _active_slots(solution, udp):
+        phase = float(solution[_phase_index(udp, orbit, slot)] % TAU)
+        fleet.append({
+            "orbit": orbit,
+            "phase": phase,
+            "signal": _orbit_signal(udp, orbit, phase),
+        })
+    return fleet
+
+
+def _to_solution(udp, fleet: list[dict]) -> np.ndarray:
+    solution = np.zeros(udp.num_orbits * (udp.max_per_orbit + 1), dtype=float)
+    counts = np.zeros(udp.num_orbits, dtype=int)
+    for spacecraft in fleet:
+        orbit = int(spacecraft["orbit"])
+        slot = counts[orbit]
+        if slot >= udp.max_per_orbit:
+            raise ValueError(f"Orbit {orbit} exceeds maximum capacity.")
+        solution[orbit] += 1
+        solution[_phase_index(udp, orbit, slot)] = float(spacecraft["phase"]) % TAU
+        counts[orbit] += 1
+    return solution
 
 
 @dataclass
@@ -201,6 +120,238 @@ class OptimizationResult:
     iterations: int
 
 
+class _Stage2Search:
+    def __init__(self, udp, initial_solution: np.ndarray, seed: int):
+        self.udp = udp
+        self.rng = np.random.default_rng(seed)
+        self.fleet = _to_fleet(udp, initial_solution)
+        self.signal_sum = self._fleet_signal(self.fleet)
+        self.current_mse = _mse(udp, self.signal_sum)
+        self.best_fleet = copy.deepcopy(self.fleet)
+        self.best_mse = self.current_mse
+        self.best_feasible_fleet = (
+            copy.deepcopy(self.fleet) if self.current_mse <= udp.mse_thresh else None
+        )
+        self.best_feasible_mse = (
+            self.current_mse if self.best_feasible_fleet is not None else float("inf")
+        )
+
+    @staticmethod
+    def _fleet_signal(fleet: list[dict]) -> np.ndarray:
+        if not fleet:
+            return np.array([], dtype=float)
+        total = np.zeros_like(fleet[0]["signal"])
+        for spacecraft in fleet:
+            total += spacecraft["signal"]
+        return total
+
+    def _count_on_orbit(self, fleet: list[dict], orbit: int) -> int:
+        return sum(int(item["orbit"] == orbit) for item in fleet)
+
+    def _insert(self, fleet: list[dict], signal_sum: np.ndarray) -> np.ndarray:
+        available = [
+            orbit for orbit in range(self.udp.num_orbits)
+            if self._count_on_orbit(fleet, orbit) < self.udp.max_per_orbit
+        ]
+        if not available:
+            return signal_sum
+        orbit = int(self.rng.choice(available))
+        phase = self._residual_phase(orbit, signal_sum)
+        signal = _orbit_signal(self.udp, orbit, phase)
+        fleet.append({"orbit": orbit, "phase": phase, "signal": signal})
+        return signal_sum + signal
+
+    def _residual_phase(self, orbit: int, signal_sum: np.ndarray) -> float:
+        residual = self.udp.target_signal - np.clip(signal_sum, 0.0, 1.0)
+        best_phase = 0.0
+        best_score = -float("inf")
+        for phase in np.linspace(0.0, TAU, 50, endpoint=False):
+            signal = _orbit_signal(self.udp, orbit, float(phase))
+            score = float(np.dot(signal, residual))
+            if score > best_score:
+                best_phase, best_score = float(phase), score
+        for phase in np.linspace(best_phase - 0.1, best_phase + 0.1, 10, endpoint=False):
+            wrapped = float(phase % TAU)
+            score = float(np.dot(_orbit_signal(self.udp, orbit, wrapped), residual))
+            if score > best_score:
+                best_phase, best_score = wrapped, score
+        return best_phase
+
+    def _replace(self):
+        candidate = copy.deepcopy(self.fleet)
+        index = int(self.rng.integers(len(candidate)))
+        removed = candidate.pop(index)
+        candidate_sum = self.signal_sum - removed["signal"]
+        candidate_sum = self._insert(candidate, candidate_sum)
+        return candidate, candidate_sum
+
+    def _multiswap(self):
+        candidate = copy.deepcopy(self.fleet)
+        amount = 2 if self.rng.random() < 0.8 else 3
+        amount = min(amount, len(candidate))
+        indices = sorted(self.rng.choice(len(candidate), size=amount, replace=False), reverse=True)
+        candidate_sum = self.signal_sum.copy()
+        for index in indices:
+            candidate_sum -= candidate[index]["signal"]
+            del candidate[int(index)]
+        for _ in range(amount):
+            candidate_sum = self._insert(candidate, candidate_sum)
+        return candidate, candidate_sum
+
+    def _phase_shift(self):
+        candidate = copy.deepcopy(self.fleet)
+        index = int(self.rng.integers(len(candidate)))
+        item = candidate[index]
+        phase = (float(item["phase"]) + self.rng.normal(0.0, 0.1)) % TAU
+        signal = _orbit_signal(self.udp, int(item["orbit"]), phase)
+        candidate_sum = self.signal_sum - item["signal"] + signal
+        item["phase"], item["signal"] = phase, signal
+        return candidate, candidate_sum
+
+    def _phase_refinement(self, fleet: list[dict]):
+        if not fleet:
+            empty = np.zeros_like(self.udp.target_signal)
+            return fleet, empty, _mse(self.udp, empty)
+
+        def objective(phases):
+            total = np.zeros_like(self.udp.target_signal)
+            for item, phase in zip(fleet, phases):
+                total += _orbit_signal(self.udp, int(item["orbit"]), float(phase))
+            return _mse(self.udp, total)
+
+        initial = np.asarray([item["phase"] for item in fleet], dtype=float)
+        result = minimize(
+            objective, initial, method="L-BFGS-B",
+            bounds=[(0.0, TAU)] * len(fleet),
+            options={"maxiter": 30, "ftol": 1e-4},
+        )
+        refined = copy.deepcopy(fleet)
+        total = np.zeros_like(self.udp.target_signal)
+        for item, phase in zip(refined, result.x):
+            wrapped = float(phase % TAU)
+            signal = _orbit_signal(self.udp, int(item["orbit"]), wrapped)
+            item["phase"], item["signal"] = wrapped, signal
+            total += signal
+        return refined, total, _mse(self.udp, total)
+
+    def _maybe_refine(self, fleet, signal_sum, value):
+        if value <= 1.06 * self.udp.mse_thresh:
+            probability = 1.0
+        elif value <= 1.20 * self.udp.mse_thresh:
+            probability = 0.1
+        else:
+            probability = 0.0
+        if self.rng.random() < probability:
+            return self._phase_refinement(fleet)
+        return fleet, signal_sum, value
+
+    def _destruction_reconstruction(self, count: int):
+        if len(self.fleet) <= count:
+            return
+        candidate = copy.deepcopy(self.fleet)
+        candidate_sum = self.signal_sum.copy()
+        for _ in range(count):
+            index = min(
+                range(len(candidate)),
+                key=lambda idx: _mse(self.udp, candidate_sum - candidate[idx]["signal"]),
+            )
+            candidate_sum -= candidate[index]["signal"]
+            del candidate[index]
+
+        for _ in range(count):
+            sampled = self.rng.choice(
+                self.udp.num_orbits,
+                size=min(150, self.udp.num_orbits),
+                replace=False,
+            )
+            best = None
+            best_value = float("inf")
+            for orbit_value in sampled:
+                orbit = int(orbit_value)
+                if self._count_on_orbit(candidate, orbit) >= self.udp.max_per_orbit:
+                    continue
+                phase = self._residual_phase(orbit, candidate_sum)
+                signal = _orbit_signal(self.udp, orbit, phase)
+                value = _mse(self.udp, candidate_sum + signal)
+                if value < best_value:
+                    best = (orbit, phase, signal)
+                    best_value = value
+            if best is None:
+                candidate_sum = self._insert(candidate, candidate_sum)
+            else:
+                orbit, phase, signal = best
+                candidate.append({"orbit": orbit, "phase": phase, "signal": signal})
+                candidate_sum += signal
+        self.fleet, self.signal_sum = candidate, candidate_sum
+        self.current_mse = _mse(self.udp, candidate_sum)
+
+    def _record_best(self):
+        improved = False
+        if self.current_mse < self.best_mse:
+            self.best_mse = self.current_mse
+            self.best_fleet = copy.deepcopy(self.fleet)
+            improved = True
+        if self.current_mse <= self.udp.mse_thresh and self.current_mse < self.best_feasible_mse:
+            self.best_feasible_mse = self.current_mse
+            self.best_feasible_fleet = copy.deepcopy(self.fleet)
+            improved = True
+        return improved
+
+    def run(self, iterations: int, log_every: int):
+        temperature = 0.5
+        temperature_min = 1e-6
+        cooling_rate = 0.999995
+        steps_since_improvement = 0
+        destruction_period = 300_000
+        reheat_after = 100_000
+
+        for iteration in range(1, iterations + 1):
+            if iteration % destruction_period == 0:
+                self._destruction_reconstruction(int(self.rng.choice((3, 4, 5))))
+                self._record_best()
+
+            draw = self.rng.random()
+            if draw < 0.4:
+                candidate, candidate_sum = self._replace()
+            elif draw < 0.5:
+                candidate, candidate_sum = self._multiswap()
+            else:
+                candidate, candidate_sum = self._phase_shift()
+
+            candidate_mse = _mse(self.udp, candidate_sum)
+            candidate, candidate_sum, candidate_mse = self._maybe_refine(
+                candidate, candidate_sum, candidate_mse
+            )
+            delta = candidate_mse - self.current_mse
+            accepted = delta < 0.0 or self.rng.random() < math.exp(
+                -delta / max(temperature, temperature_min)
+            )
+            if accepted:
+                self.fleet, self.signal_sum, self.current_mse = (
+                    candidate, candidate_sum, candidate_mse
+                )
+                if self._record_best():
+                    steps_since_improvement = 0
+                else:
+                    steps_since_improvement += 1
+            else:
+                steps_since_improvement += 1
+
+            temperature = max(temperature_min, temperature * cooling_rate)
+            if steps_since_improvement >= reheat_after and temperature < 0.05:
+                temperature = 0.5
+                steps_since_improvement = 0
+
+            if log_every and iteration % log_every == 0:
+                print(
+                    f"Iteration {iteration}/{iterations} | T={temperature:.6g} "
+                    f"| N={len(self.fleet)} | Current MSE={self.current_mse:.8f} "
+                    f"| Best MSE={self.best_mse:.8f}"
+                )
+
+        return self.best_feasible_fleet or self.best_fleet
+
+
 def adaptive_simulated_annealing(
     udp,
     initial_solution: np.ndarray,
@@ -209,260 +360,41 @@ def adaptive_simulated_annealing(
     refine_every: int = 2_000,
     log_every: int = 1_000,
 ) -> OptimizationResult:
-    """Improve a starting fleet without changing its spacecraft budget."""
-    start_time = time.time()
-    rng = np.random.default_rng(seed)
-
-    current = np.asarray(initial_solution, dtype=float).copy()
+    """Run the supplied ESA Stage 2 strategy on this project's chromosome."""
+    started = time.time()
+    initial = np.asarray(initial_solution, dtype=float).copy()
     expected = udp.num_orbits * (udp.max_per_orbit + 1)
+    if initial.size != expected:
+        raise ValueError(f"Expected solution length {expected}, got {initial.size}.")
+    initial[:udp.num_orbits] = np.rint(initial[:udp.num_orbits])
 
-    if current.size != expected:
+    _, _, initial_official_mse = udp.fitness(initial, postprocess=True)
+    if float(initial_official_mse) > udp.mse_thresh:
         raise ValueError(
-            f"Expected solution length {expected}, got {current.size}."
+            f"Initial solution must be feasible; official MSE={float(initial_official_mse):.12f}"
         )
 
-    # Canonicalize count fields and validate the supplied fleet with the evaluator.
-    current[:udp.num_orbits] = np.rint(
-        current[:udp.num_orbits]
-    )
+    search = _Stage2Search(udp, initial, seed)
+    budget = len(search.fleet)
+    print("\nESA STAGE 2 SA (ADAPTED)")
+    print("------------------------")
+    print(f"Initial fleet: {budget} spacecraft | MSE: {search.current_mse:.12f}")
 
-    current_raw = _raw_fleet_signal(udp, current)
-    current_mse = _mse_from_raw(udp, current_raw)
+    fleet = search.run(iterations, log_every)
+    best_solution = _to_solution(udp, fleet)
+    objective, spacecraft, official_mse = udp.fitness(best_solution, postprocess=True)
 
-    best = current.copy()
-    best_mse = current_mse
-    budget = int(round(current[:udp.num_orbits].sum()))
-
-    temperature = 0.05
-    min_temperature = 1e-5
-    cooling = 0.9995
-    stale = 0
-
-    print("\nADAPTIVE SIMULATED ANNEALING")
-    print("----------------------------")
-    print(
-        f"Initial fleet: {budget} spacecraft | "
-        f"MSE: {current_mse:.12f}"
-    )
-
-    for step in range(1, iterations + 1):
-        candidate = current.copy()
-        candidate_raw = current_raw.copy()
-        slots = _active_slots(current, udp)
-
-        if not slots:
-            break
-
-        move = rng.random()
-
-        if move < 0.50:
-            # Replace one spacecraft with one on a different available orbit.
-            orbit, slot = slots[int(rng.integers(len(slots)))]
-            old_phase = float(
-                current[_phase_index(udp, orbit, slot)]
-            )
-
-            candidate_raw -= _orbit_signal(
-                udp, orbit, old_phase
-            )
-
-            reduced = _remove_slot(
-                current, udp, orbit, slot
-            )
-
-            available = np.flatnonzero(
-                reduced[:udp.num_orbits] < udp.max_per_orbit
-            )
-
-            if available.size:
-                new_orbit = int(rng.choice(available))
-                phase = _residual_phase(
-                    udp,
-                    new_orbit,
-                    np.clip(candidate_raw, 0.0, 1.0),
-                    rng,
-                )
-                candidate = _add_to_orbit(
-                    reduced, udp, new_orbit, phase
-                )
-                candidate_raw += _orbit_signal(
-                    udp, new_orbit, phase
-                )
-
-        elif move < 0.72 and len(slots) >= 2:
-            # Multi-swap: remove two or three and reconstruct the same number.
-            amount = min(
-                len(slots),
-                3 if rng.random() < 0.2 else 2,
-            )
-
-            chosen = rng.choice(
-                len(slots),
-                size=amount,
-                replace=False,
-            )
-
-            removals = [
-                slots[int(i)] for i in chosen
-            ]
-
-            candidate = current.copy()
-
-            # Remove descending slot order within each orbit to keep indices valid.
-            for orbit in sorted({o for o, _ in removals}):
-                orbit_removals = sorted(
-                    (
-                        x for x in removals
-                        if x[0] == orbit
-                    ),
-                    key=lambda x: x[1],
-                    reverse=True,
-                )
-
-                for _, slot in orbit_removals:
-                    old_phase = float(
-                        candidate[_phase_index(udp, orbit, slot)]
-                    )
-                    candidate_raw -= _orbit_signal(
-                        udp, orbit, old_phase
-                    )
-                    candidate = _remove_slot(
-                        candidate, udp, orbit, slot
-                    )
-
-            for _ in range(amount):
-                available = np.flatnonzero(
-                    candidate[:udp.num_orbits] < udp.max_per_orbit
-                )
-
-                if not available.size:
-                    break
-
-                new_orbit = int(rng.choice(available))
-                phase = _residual_phase(
-                    udp,
-                    new_orbit,
-                    np.clip(candidate_raw, 0.0, 1.0),
-                    rng,
-                )
-
-                candidate = _add_to_orbit(
-                    candidate, udp, new_orbit, phase
-                )
-
-                candidate_raw += _orbit_signal(
-                    udp, new_orbit, phase
-                )
-
-        else:
-            # Local phase mutation.
-            orbit, slot = slots[int(rng.integers(len(slots)))]
-            idx = _phase_index(udp, orbit, slot)
-
-            old_phase = float(candidate[idx])
-            sigma = max(
-                0.015,
-                0.20 * (temperature / 0.05),
-            )
-
-            candidate[idx] = (
-                candidate[idx] + rng.normal(0.0, sigma)
-            ) % TAU
-
-            candidate_raw += (
-                _orbit_signal(
-                    udp, orbit, float(candidate[idx])
-                )
-                - _orbit_signal(udp, orbit, old_phase)
-            )
-
-        # Guard the fixed-budget invariant.
-        if int(round(candidate[:udp.num_orbits].sum())) != budget:
-            continue
-
-        candidate_mse = _mse_from_raw(
-            udp, candidate_raw
-        )
-
-        delta = candidate_mse - current_mse
-
-        if (
-            delta <= 0.0
-            or rng.random()
-            < math.exp(
-                -delta / max(temperature, min_temperature)
-            )
-        ):
-            current = candidate
-            current_mse = candidate_mse
-            current_raw = candidate_raw
-
-        if current_mse < best_mse:
-            best = current.copy()
-            best_mse = current_mse
-            stale = 0
-        else:
-            stale += 1
-
-        temperature = max(
-            min_temperature,
-            temperature * cooling,
-        )
-
-        if stale >= 2_500:
-            temperature = max(temperature, 0.02)
-            stale = 0
-
-        if refine_every and step % refine_every == 0:
-            refined = _phase_refine(
-                udp, best, maxiter=20
-            )
-
-            refined_mse = _mse_from_raw(
-                udp,
-                _raw_fleet_signal(udp, refined),
-            )
-
-            if refined_mse < best_mse:
-                best = refined
-                best_mse = refined_mse
-                current = refined.copy()
-                current_mse = refined_mse
-                current_raw = _raw_fleet_signal(
-                    udp, current
-                )
-
-        if log_every and step % log_every == 0:
-            print(
-                f"Iteration {step}/{iterations} | "
-                f"Best MSE: {best_mse:.12f} | "
-                f"T: {temperature:.6g}"
-            )
-
-    # Final local phase refinement; keep it only if it improves official MSE.
-    refined = _phase_refine(
-        udp, best, maxiter=40
-    )
-
-    refined_mse = _mse_from_raw(
-        udp,
-        _raw_fleet_signal(udp, refined),
-    )
-
-    if refined_mse < best_mse:
-        best = refined
-        best_mse = refined_mse
-
-    objective, spacecraft, official_mse = udp.fitness(
-        best, postprocess=True
-    )
+    # Keep the returned candidate only if the official evaluator agrees it is feasible.
+    if float(official_mse) > udp.mse_thresh:
+        best_solution = initial
+        objective, spacecraft, official_mse = udp.fitness(best_solution, postprocess=True)
 
     return OptimizationResult(
-        best_solution=best,
+        best_solution=best_solution,
         objective=float(objective[0]),
         spacecraft=int(spacecraft),
         mse=float(official_mse),
         feasible=float(official_mse) <= udp.mse_thresh,
-        runtime=time.time() - start_time,
+        runtime=time.time() - started,
         iterations=iterations,
     )
